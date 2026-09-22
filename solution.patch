@@ -1,0 +1,706 @@
+diff --git a/lib/binary_parser.ts b/lib/binary_parser.ts
+index cf511f6..7e73dd8 100644
+--- a/lib/binary_parser.ts
++++ b/lib/binary_parser.ts
+@@ -1,3 +1,21 @@
++import {
++  BinarySource,
++  FrameLengthResolver,
++  ParserStream,
++  ParserStreamError,
++  ParserStreamOptions,
++} from "./stream_parser";
++import { BinaryChunk } from "./stream_buffer";
++
++export {
++  BinaryChunk,
++  BinarySource,
++  FrameLengthResolver,
++  ParserStream,
++  ParserStreamError,
++  ParserStreamOptions,
++};
++
+ class Context {
+   code = "";
+   scopes = [["vars"]];
+@@ -931,6 +949,45 @@ export class Parser {
+     return this.compiled!(buffer, this.constructorFn);
+   }
+ 
++  createStream(options: ParserStreamOptions = {}): ParserStream<any> {
++    const frameLength = this.getStreamFrameLength(options);
++    return new ParserStream(
++      (buffer) => this.parse(buffer),
++      frameLength,
++      options,
++    );
++  }
++
++  parseStream(
++    source: BinarySource,
++    options: ParserStreamOptions = {},
++  ): ParserStream<any> {
++    const frameLength = this.getStreamFrameLength(options);
++    return ParserStream.from(
++      source,
++      (buffer) => this.parse(buffer),
++      frameLength,
++      options,
++    );
++  }
++
++  private getStreamFrameLength(
++    options: ParserStreamOptions,
++  ): number | FrameLengthResolver {
++    if (options.frameLength !== undefined) {
++      return options.frameLength;
++    }
++
++    const size = this.sizeOf();
++    if (!Number.isSafeInteger(size) || size <= 0) {
++      throw new Error(
++        "A positive frameLength is required for parsers without a static size",
++      );
++    }
++
++    return size;
++  }
++
+   private setNextParser(
+     type: Types,
+     varName: string,
+diff --git a/lib/stream_buffer.ts b/lib/stream_buffer.ts
+new file mode 100644
+index 0000000..96b947d
+--- /dev/null
++++ b/lib/stream_buffer.ts
+@@ -0,0 +1,147 @@
++export type BinaryChunk = Buffer | Uint8Array;
++
++interface Segment {
++  bytes: Uint8Array;
++  offset: number;
++}
++
++export class StreamBuffer {
++  private segments: Segment[] = [];
++  private byteLength = 0;
++  private constructorType: typeof Buffer | typeof Uint8Array | undefined;
++
++  get length(): number {
++    return this.byteLength;
++  }
++
++  get empty(): boolean {
++    return this.byteLength === 0;
++  }
++
++  append(chunk: BinaryChunk): void {
++    if (!(chunk instanceof Uint8Array)) {
++      throw new TypeError("Stream chunks must be Buffer or Uint8Array values");
++    }
++
++    if (chunk.byteLength === 0) {
++      return;
++    }
++
++    if (!this.constructorType) {
++      this.constructorType = this.getConstructor(chunk);
++    }
++
++    const bytes = new Uint8Array(chunk.byteLength);
++    bytes.set(chunk);
++    this.segments.push({ bytes, offset: 0 });
++    this.byteLength += bytes.byteLength;
++  }
++
++  peek(length: number = this.byteLength): BinaryChunk {
++    this.validateLength(length);
++
++    if (length === 0) {
++      return this.allocate(0);
++    }
++
++    const first = this.segments[0];
++    const available = first.bytes.byteLength - first.offset;
++    if (available >= length) {
++      return this.convert(
++        first.bytes.subarray(first.offset, first.offset + length),
++      );
++    }
++
++    const result = this.allocate(length);
++    this.copyInto(result, length);
++    return result;
++  }
++
++  read(length: number): BinaryChunk {
++    const result = this.peek(length);
++    this.discard(length);
++    return result;
++  }
++
++  discard(length: number): void {
++    this.validateLength(length);
++
++    let remaining = length;
++    while (remaining > 0) {
++      const segment = this.segments[0];
++      const available = segment.bytes.byteLength - segment.offset;
++      if (remaining < available) {
++        segment.offset += remaining;
++        this.byteLength -= remaining;
++        return;
++      }
++
++      remaining -= available;
++      this.byteLength -= available;
++      this.segments.shift();
++    }
++  }
++
++  clear(): void {
++    this.segments = [];
++    this.byteLength = 0;
++  }
++
++  private validateLength(length: number): void {
++    if (!Number.isSafeInteger(length) || length < 0) {
++      throw new RangeError("Buffer length must be a non-negative safe integer");
++    }
++
++    if (length > this.byteLength) {
++      throw new RangeError(
++        `Cannot read ${length} bytes from a ${this.byteLength}-byte stream buffer`,
++      );
++    }
++  }
++
++  private getConstructor(
++    chunk: BinaryChunk,
++  ): typeof Buffer | typeof Uint8Array {
++    if (typeof Buffer !== "undefined" && Buffer.isBuffer(chunk)) {
++      return Buffer;
++    }
++
++    return Uint8Array;
++  }
++
++  private allocate(length: number): BinaryChunk {
++    if (this.constructorType === Buffer) {
++      return Buffer.allocUnsafe(length);
++    }
++
++    return new Uint8Array(length);
++  }
++
++  private convert(bytes: Uint8Array): BinaryChunk {
++    if (this.constructorType === Buffer) {
++      return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
++    }
++
++    return bytes;
++  }
++
++  private copyInto(target: BinaryChunk, length: number): void {
++    let written = 0;
++    let remaining = length;
++
++    for (const segment of this.segments) {
++      if (remaining === 0) {
++        return;
++      }
++
++      const available = segment.bytes.byteLength - segment.offset;
++      const copied = Math.min(available, remaining);
++      target.set(
++        segment.bytes.subarray(segment.offset, segment.offset + copied),
++        written,
++      );
++      written += copied;
++      remaining -= copied;
++    }
++  }
++}
+diff --git a/lib/stream_parser.ts b/lib/stream_parser.ts
+new file mode 100644
+index 0000000..c66a166
+--- /dev/null
++++ b/lib/stream_parser.ts
+@@ -0,0 +1,461 @@
++import { BinaryChunk, StreamBuffer } from "./stream_buffer";
++
++export type FrameLengthResult = number | null | undefined;
++export type FrameLengthResolver = (buffered: BinaryChunk) => FrameLengthResult;
++export type BinarySource = AsyncIterable<BinaryChunk> | Iterable<BinaryChunk>;
++
++export interface ParserStreamOptions {
++  frameLength?: number | FrameLengthResolver;
++  maxBufferSize?: number;
++  highWaterMark?: number;
++  signal?: AbortSignal;
++}
++
++export type ParserStreamErrorCode =
++  | "ABORTED"
++  | "BUFFER_LIMIT_EXCEEDED"
++  | "INCOMPLETE_FRAME"
++  | "INVALID_FRAME_LENGTH"
++  | "STREAM_CLOSED";
++
++interface ParserStreamErrorDetails {
++  bufferedBytes?: number;
++  expectedBytes?: number;
++  maxBufferSize?: number;
++  cause?: unknown;
++}
++
++export class ParserStreamError extends Error {
++  readonly code: ParserStreamErrorCode;
++  readonly bufferedBytes?: number;
++  readonly expectedBytes?: number;
++  readonly maxBufferSize?: number;
++  readonly cause?: unknown;
++
++  constructor(
++    code: ParserStreamErrorCode,
++    message: string,
++    details: ParserStreamErrorDetails = {},
++  ) {
++    super(message);
++    this.name = "ParserStreamError";
++    this.code = code;
++    this.bufferedBytes = details.bufferedBytes;
++    this.expectedBytes = details.expectedBytes;
++    this.maxBufferSize = details.maxBufferSize;
++    this.cause = details.cause;
++    Object.setPrototypeOf(this, new.target.prototype);
++  }
++}
++
++interface PendingRead<T> {
++  resolve: (result: IteratorResult<T>) => void;
++  reject: (reason: unknown) => void;
++}
++
++interface PendingCapacity {
++  resolve: () => void;
++  reject: (reason: unknown) => void;
++}
++
++type ParserFunction<T> = (buffer: BinaryChunk) => T;
++
++export class ParserStream<T> implements AsyncIterableIterator<T> {
++  private readonly parseFrame: ParserFunction<T>;
++  private readonly frameLength: number | FrameLengthResolver;
++  private readonly maxBufferSize: number;
++  private readonly highWaterMark: number;
++  private readonly buffer = new StreamBuffer();
++  private readonly values: T[] = [];
++  private readonly readers: PendingRead<T>[] = [];
++  private readonly capacityWaiters: PendingCapacity[] = [];
++  private readonly signal?: AbortSignal;
++  private sourceIterator?: AsyncIterator<BinaryChunk>;
++  private sourceTask?: Promise<void>;
++  private expectedFrameLength?: number;
++  private state: "open" | "ended" | "failed" = "open";
++  private failure?: unknown;
++  private abortListener?: () => void;
++
++  constructor(
++    parseFrame: ParserFunction<T>,
++    frameLength: number | FrameLengthResolver,
++    options: ParserStreamOptions = {},
++  ) {
++    this.parseFrame = parseFrame;
++    this.frameLength = frameLength;
++    this.maxBufferSize = options.maxBufferSize ?? 16 * 1024 * 1024;
++    this.highWaterMark = options.highWaterMark ?? 16;
++    this.signal = options.signal;
++    this.validateOptions();
++
++    if (this.signal) {
++      this.abortListener = () => {
++        this.abort(this.signal?.reason);
++      };
++      if (this.signal.aborted) {
++        this.abort(this.signal.reason);
++      } else {
++        this.signal.addEventListener("abort", this.abortListener, {
++          once: true,
++        });
++      }
++    }
++  }
++
++  get bufferedBytes(): number {
++    return this.buffer.length;
++  }
++
++  get queuedResults(): number {
++    return this.values.length;
++  }
++
++  get closed(): boolean {
++    return this.state !== "open";
++  }
++
++  static from<T>(
++    source: BinarySource,
++    parseFrame: ParserFunction<T>,
++    frameLength: number | FrameLengthResolver,
++    options: ParserStreamOptions = {},
++  ): ParserStream<T> {
++    const stream = new ParserStream(parseFrame, frameLength, options);
++    stream.attach(source);
++    return stream;
++  }
++
++  [Symbol.asyncIterator](): AsyncIterableIterator<T> {
++    return this;
++  }
++
++  async next(): Promise<IteratorResult<T>> {
++    if (this.values.length > 0) {
++      const value = this.values.shift()!;
++      this.releaseCapacity();
++      return { done: false, value };
++    }
++
++    if (this.state === "failed") {
++      throw this.failure;
++    }
++
++    if (this.state === "ended") {
++      return { done: true, value: undefined as never };
++    }
++
++    return new Promise<IteratorResult<T>>((resolve, reject) => {
++      this.readers.push({ resolve, reject });
++    });
++  }
++
++  async return(): Promise<IteratorResult<T>> {
++    if (this.state === "open") {
++      this.finish(false);
++      await this.closeSource();
++    }
++
++    return { done: true, value: undefined as never };
++  }
++
++  async throw(reason?: unknown): Promise<IteratorResult<T>> {
++    this.abort(reason);
++    await this.closeSource();
++    throw this.failure;
++  }
++
++  async write(chunk: BinaryChunk): Promise<void> {
++    this.ensureOpen();
++    this.buffer.append(chunk);
++
++    try {
++      this.processFrames();
++      this.enforceBufferLimit();
++    } catch (error) {
++      this.fail(error);
++      throw error;
++    }
++
++    if (this.values.length >= this.highWaterMark) {
++      await new Promise<void>((resolve, reject) => {
++        this.capacityWaiters.push({ resolve, reject });
++      });
++    }
++  }
++
++  end(): void {
++    this.ensureOpen();
++
++    try {
++      this.processFrames();
++      if (!this.buffer.empty) {
++        const expected = this.resolveExpectedLength();
++        throw new ParserStreamError(
++          "INCOMPLETE_FRAME",
++          `Stream ended with ${this.buffer.length} buffered bytes`,
++          {
++            bufferedBytes: this.buffer.length,
++            expectedBytes: expected,
++          },
++        );
++      }
++      this.finish(true);
++    } catch (error) {
++      this.fail(error);
++      throw error;
++    }
++  }
++
++  abort(reason?: unknown): void {
++    if (this.state !== "open") {
++      return;
++    }
++
++    const error =
++      reason instanceof ParserStreamError
++        ? reason
++        : new ParserStreamError("ABORTED", "Stream parsing was aborted", {
++            bufferedBytes: this.buffer.length,
++            cause: reason,
++          });
++    this.fail(error, false);
++    void this.closeSource();
++  }
++
++  private attach(source: BinarySource): void {
++    if (this.sourceTask) {
++      throw new Error("A source is already attached to this parser stream");
++    }
++
++    this.sourceIterator = this.getSourceIterator(source);
++    this.sourceTask = this.pumpSource();
++    void this.sourceTask.catch(() => undefined);
++  }
++
++  private async pumpSource(): Promise<void> {
++    try {
++      while (this.state === "open") {
++        const item = await this.sourceIterator!.next();
++        if (item.done) {
++          if (this.state === "open") {
++            this.end();
++          }
++          return;
++        }
++        await this.write(item.value);
++      }
++    } catch (error) {
++      if (this.state === "open") {
++        this.fail(error);
++      }
++    }
++  }
++
++  private getSourceIterator(source: BinarySource): AsyncIterator<BinaryChunk> {
++    if (Symbol.asyncIterator in source) {
++      return source[Symbol.asyncIterator]();
++    }
++
++    const iterator = source[Symbol.iterator]();
++    return {
++      async next() {
++        return iterator.next();
++      },
++      async return() {
++        if (iterator.return) {
++          return iterator.return();
++        }
++        return { done: true, value: undefined };
++      },
++      async throw(reason?: unknown) {
++        if (iterator.throw) {
++          return iterator.throw(reason);
++        }
++        throw reason;
++      },
++    };
++  }
++
++  private processFrames(): void {
++    while (this.state === "open") {
++      const length = this.resolveExpectedLength();
++      if (length === undefined || this.buffer.length < length) {
++        return;
++      }
++
++      const frame = this.buffer.read(length);
++      this.expectedFrameLength = undefined;
++      const value = this.parseFrame(frame);
++      this.publish(value);
++    }
++  }
++
++  private resolveExpectedLength(): number | undefined {
++    if (this.expectedFrameLength !== undefined) {
++      return this.expectedFrameLength;
++    }
++
++    const result =
++      typeof this.frameLength === "number"
++        ? this.frameLength
++        : this.frameLength(this.buffer.peek());
++
++    if (result === null || result === undefined) {
++      return undefined;
++    }
++
++    if (!Number.isSafeInteger(result) || result <= 0) {
++      throw new ParserStreamError(
++        "INVALID_FRAME_LENGTH",
++        `Frame length must be a positive safe integer, received ${String(
++          result,
++        )}`,
++        { bufferedBytes: this.buffer.length },
++      );
++    }
++
++    if (result > this.maxBufferSize) {
++      throw new ParserStreamError(
++        "BUFFER_LIMIT_EXCEEDED",
++        `Frame length ${result} exceeds the ${this.maxBufferSize}-byte buffer limit`,
++        {
++          bufferedBytes: this.buffer.length,
++          expectedBytes: result,
++          maxBufferSize: this.maxBufferSize,
++        },
++      );
++    }
++
++    this.expectedFrameLength = result;
++    return result;
++  }
++
++  private publish(value: T): void {
++    const reader = this.readers.shift();
++    if (reader) {
++      reader.resolve({ done: false, value });
++      return;
++    }
++
++    this.values.push(value);
++  }
++
++  private finish(preserveValues: boolean): void {
++    this.state = "ended";
++    this.detachAbortListener();
++    this.buffer.clear();
++    this.expectedFrameLength = undefined;
++
++    if (!preserveValues) {
++      this.values.length = 0;
++    }
++
++    while (this.readers.length > 0) {
++      this.readers.shift()!.resolve({ done: true, value: undefined as never });
++    }
++    this.releaseAllCapacity();
++  }
++
++  private fail(error: unknown, preserveValues: boolean = true): void {
++    if (this.state !== "open") {
++      return;
++    }
++
++    this.state = "failed";
++    this.failure = error;
++    this.detachAbortListener();
++    this.buffer.clear();
++    this.expectedFrameLength = undefined;
++    if (!preserveValues) {
++      this.values.length = 0;
++    }
++
++    while (this.readers.length > 0) {
++      this.readers.shift()!.reject(error);
++    }
++    while (this.capacityWaiters.length > 0) {
++      this.capacityWaiters.shift()!.reject(error);
++    }
++  }
++
++  private ensureOpen(): void {
++    if (this.state === "failed") {
++      throw this.failure;
++    }
++
++    if (this.state === "ended") {
++      throw new ParserStreamError("STREAM_CLOSED", "Parser stream is closed");
++    }
++  }
++
++  private enforceBufferLimit(): void {
++    if (this.buffer.length <= this.maxBufferSize) {
++      return;
++    }
++
++    throw new ParserStreamError(
++      "BUFFER_LIMIT_EXCEEDED",
++      `Buffered data exceeds the ${this.maxBufferSize}-byte limit`,
++      {
++        bufferedBytes: this.buffer.length,
++        expectedBytes: this.expectedFrameLength,
++        maxBufferSize: this.maxBufferSize,
++      },
++    );
++  }
++
++  private releaseCapacity(): void {
++    if (this.values.length >= this.highWaterMark) {
++      return;
++    }
++
++    this.capacityWaiters.shift()?.resolve();
++  }
++
++  private releaseAllCapacity(): void {
++    while (this.capacityWaiters.length > 0) {
++      this.capacityWaiters.shift()!.resolve();
++    }
++  }
++
++  private async closeSource(): Promise<void> {
++    const iterator = this.sourceIterator;
++    this.sourceIterator = undefined;
++    if (iterator?.return) {
++      try {
++        await iterator.return();
++      } catch (error) {
++        if (this.state === "open") {
++          this.fail(error);
++        }
++      }
++    }
++  }
++
++  private detachAbortListener(): void {
++    if (this.signal && this.abortListener) {
++      this.signal.removeEventListener("abort", this.abortListener);
++      this.abortListener = undefined;
++    }
++  }
++
++  private validateOptions(): void {
++    if (!Number.isSafeInteger(this.maxBufferSize) || this.maxBufferSize <= 0) {
++      throw new RangeError("maxBufferSize must be a positive safe integer");
++    }
++
++    if (!Number.isSafeInteger(this.highWaterMark) || this.highWaterMark <= 0) {
++      throw new RangeError("highWaterMark must be a positive safe integer");
++    }
++
++    if (typeof this.frameLength === "number") {
++      if (!Number.isSafeInteger(this.frameLength) || this.frameLength <= 0) {
++        throw new RangeError("frameLength must be a positive safe integer");
++      }
++      if (this.frameLength > this.maxBufferSize) {
++        throw new RangeError("frameLength must not exceed maxBufferSize");
++      }
++    }
++  }
++}
+diff --git a/tsconfig.json b/tsconfig.json
+index 938d0b4..97ad895 100644
+--- a/tsconfig.json
++++ b/tsconfig.json
+@@ -13,6 +13,8 @@
+     "esModuleInterop": true
+   },
+   "files": [
+-    "lib/binary_parser.ts"
++    "lib/binary_parser.ts",
++    "lib/stream_buffer.ts",
++    "lib/stream_parser.ts"
+   ]
+ }
